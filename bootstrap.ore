@@ -1,5 +1,6 @@
-
 extern def readFileBytes(filename: *Byte, length: *Int): *Byte
+extern def printLine(text: *Byte, length: Int): Unit
+extern def fail(): Unit
 
 struct SourceFile {
 	data: Seq[Byte]
@@ -13,6 +14,8 @@ struct Token {
 }
 
 val TokIdent = 1001
+val TokString = 1002
+val TokNumber = 1003
 
 val TokPostEq = 2000
 val TokAddAssign = TokPostEq + c"+"
@@ -21,6 +24,11 @@ val TokMulAssign = TokPostEq + c"*"
 val TokDivAssign = TokPostEq + c"/"
 val TokEqual = TokPostEq + c"="
 val TokNotEqual = TokPostEq + c"!"
+val TokLessEqual = TokPostEq + c"<"
+val TokGreaterEqual = TokPostEq + c">"
+
+val TokAnd = 3001
+val TokOr = 3002
 
 def loadFile(f: *SourceFile, filename: String): Unit = {
 	val cstr: Array[Byte, 1024]
@@ -47,6 +55,11 @@ def eat(f: *SourceFile): Byte = {
 	peek(f)
 }
 
+def error(token: Token, message: String): Unit = {
+	printLine(message.data, message.count)
+	fail()
+}
+
 def range(c: Byte, bounds: Seq[Byte]): Bool = c >= bounds[0] && c <= bounds[1]
 
 def contained(c: Byte, options: Seq[Byte]): Bool = {
@@ -57,13 +70,14 @@ def contained(c: Byte, options: Seq[Byte]): Bool = {
 }
 
 def lex(f: *SourceFile): Token = {
-	var tok: Token = { file = f; begin = f.position }
 	var c = peek(f)
 
 label whitespace:
 	while (c == c" " || c == c"\t" || c == c"\r") {
 		c = eat(f)
 	}
+
+	var tok: Token = { file = f; begin = f.position }
 
 	if (c == c"/") {
 		val la = eat(f)
@@ -94,25 +108,46 @@ label whitespace:
 		}
 	}
 
+	if (range(c, "09")) {
+		do {
+			c = eat(f)
+		} while (range(c, "09"))
+		
+		tok.type = TokNumber
+		goto accept
+	}
+
 label string:
 	if (c == c"\"") {
 		do {
 			c = eat(f)
-			if (c == c"\\") c = eat(f)
-		} while (c != c"\"" && c != c"\\")
+			if (c == c"\\") {
+				if (eat(f) == 0) error(tok, "Expected an escape sequence")
+			}
+			if (c == c"\n") error(tok, "Newline in string")
+		} while (c != c"\"" && c != c"\0")
+
+		if (c != c"\"") {
+			error(tok, "String not closed")
+		} else {
+			tok.type = TokString
+			goto accept
+		}
 	}
 
 	val la = eat(f)
-	if (contained(c, ":()[]{};\n")) {
+	if (contained(c, ":()[]{};\n") || c == c"\0") {
 		tok.type = c
-		goto accept
 	} else if (contained(c, "+-/*!=")) {
 		if (la == c"=") {
 			tok.type = TokPostEq + c
 		} else {
 			tok.type = c
 		}
-		goto accept
+	} else if (c == c"&") {
+		tok.type = if (la == c) TokAnd else c
+	} else if (c == c"|") {
+		tok.type = if (la == c) TokOr else c
 	} else {
 		error(tok, "Unexpected character")
 	}
@@ -121,3 +156,4 @@ label accept:
 	tok.end = f.position
 	tok
 }
+
