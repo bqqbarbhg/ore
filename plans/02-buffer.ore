@@ -1,5 +1,6 @@
 
 namespace builtin extern "Builtin" {
+	type Unit
 	type Int
 
 	type BuiltinArray[T: Type, N: Int]
@@ -117,7 +118,7 @@ class Buffer[T: Type] unsafe {
 		data = newData
 	}
 
-	def +=(value: T) {
+	def push(value: T) {
 		if (count >= data.count) {
 			grow(count + 1)
 		}
@@ -138,11 +139,11 @@ def main() {
 	val bufB = new Buffer[Int]
 	val bufBuf = new Buffer[Buffer[Int]]
 
-	bufA += 1
-	bufB += 2
-	bufA += 3
+	bufA.push(1)
+	bufB.push(2)
+	bufA.push(3)
 
-	bufBuf += move(bufA)
-	bufBuf += move(bufB)
+	bufBuf.push(move(bufA))
+	bufBuf.push(move(bufB))
 }
 
