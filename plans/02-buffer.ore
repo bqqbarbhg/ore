@@ -1,0 +1,148 @@
+
+namespace builtin extern "Builtin" {
+	type Int
+
+	type BuiltinArray[T: Type, N: Int]
+	type Pointer[T]
+
+	def castPointer[From, To](ptr: Pointer[From]): Pointer[To]
+	def pointerToRef[T](ptr: Pointer[T]): *T
+
+	def alloc(size: Int): Ptr[Byte]
+	def free(ptr: Ptr[Byte]): Unit
+
+	def (t: T): Unit
+
+	def assertFail(): Unit
+	def moveFromRef(t: *T): T
+}
+
+def moveFromRef(t: *T): T = builtin.moveFromRef(t)
+
+inline def assert(cond: Bool): Unit = {
+	if (!cond) {
+		builtin.assertFail()
+	}
+}
+
+struct Type {
+	size: Int
+}
+
+trait Cast[T: Type] {
+	def cast: T
+}
+
+type Ptr[T: Type] = builtin.Pointer[T]
+
+impl Ptr extends Cast[Ptr[R]] {
+	inline def cast: Ptr[R] = builtin.castPointer[T, R](this)
+}
+
+impl Ptr extends Cast[*T] {
+	inline def cast: *T = builtin.pointerToRef[T](this)
+}
+
+struct Seq[T: Type] {
+	var data: Ptr[T]
+	var count: Int
+
+	inline def apply(index: Int): *T = {
+		assert(index < count)
+		(data + index).cast
+	}
+}
+
+unsafe struct UnsafeArray[T: Type, N: Int] extends Cast[Seq[T]] {
+	val storage: builtin.BuiltinArray[T, N]
+
+	def data: Ptr[T] = storage.pointer
+	def count: Int = T
+
+	def cast: Seq[T] = new { data, count }
+
+	inline def apply(index: Int): *T = {
+		assert(index < count)
+		(data + index).cast
+	}
+}
+
+def min[T](a: T, b: T): T = if (a < b) a else b
+def max[T](a: T, b: T): T = if (a > b) a else b
+
+def allocSeq[T](num: Int): Seq[T] = {
+	val ptr = builtin.alloc(T.size)
+	new { ptr.cast, num }
+}
+
+def freeSeq[T](seq: Seq[T]) {
+	builtin.free(seq.data.cast)
+}
+
+class Buffer[T: Type] unsafe {
+	var data: Seq[T] = internal
+	var count: Int = 0
+	var internal: UnsafeArray[T, 16]
+
+	unsafe def moveFrom(src: T) {
+		if (src.data.data == src.internal.data) {
+			data = internal
+			count = src.count
+			for (i <- 0 until count) {
+				internal(i).moveFrom(moveFromRef(src.internal(i)))
+			}
+		} else {
+			*this = *src
+		}
+	}
+
+	def free() {
+		for (i <- 0 until count) {
+			data(i).free()
+		}
+
+		if (data.data != internal.data) {
+			freeSeq(data)
+		}
+	}
+
+	def grow(minCap: Int) {
+		val cap = max(data.count * 2, minCap)
+		val newData = allocSeq(cap)
+		for (i <- 0 until count) {
+			newData(i).moveFrom(moveFromRef(data(i)))
+		}
+		if (data.data != internal.data)
+			freeSeq(data)
+		data = newData
+	}
+
+	def +=(value: T) {
+		if (count >= data.count) {
+			grow(count + 1)
+		}
+		data(count).moveFrom(value)
+		count += 1
+	}
+
+	def apply(index: Int): *T = data(index)
+	def update(index: Int, value: T) {
+		data(index).free()
+		data(index).moveFrom(value)
+	}
+
+}
+
+def main() {
+	val bufA = new Buffer[Int]
+	val bufB = new Buffer[Int]
+	val bufBuf = new Buffer[Buffer[Int]]
+
+	bufA += 1
+	bufB += 2
+	bufA += 3
+
+	bufBuf += move(bufA)
+	bufBuf += move(bufB)
+}
+

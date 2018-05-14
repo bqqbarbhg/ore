@@ -1,0 +1,107 @@
+
+struct Seq[T: Type] {
+	var data: *T
+	var count: Int
+}
+
+class Buffer[T: Type] {
+	var data: Seq[T]
+	var count: Int
+
+	def init(): Unit = {
+		val cap = 16
+		this.data = allocSeq[T](cap)
+		this.count = 0
+	}
+
+	def copy: This = {
+		val r = new This()
+		r.data = copySeq(this.data, count)
+		r.count = count
+		r
+	}
+
+	def free(): Unit = {
+		for (i <- 0 until count) (data + i).free()
+		free(data)
+	}
+
+	def +=(item: !T): Unit = {
+		if (count >= data.count) {
+			val cap = data.count * 2 + 1
+			data = allocSeq[T](cap)
+		}
+
+		data(count) = move(item)
+		count += 1
+	}
+}
+
+class RefCell[T](val value: T) {
+	var refcount: Int
+}
+
+class Rc[T: Type] {
+	var cell: *RefCell[T]
+
+	def init(value: !T): Unit = {
+		cell = alloc[RefCell[T]](move(value))
+	}
+
+	def free(): Unit = {
+		
+	}
+
+	def copy: This = {
+		refcount += 1
+	}
+}
+
+buf: Rc Buffer[Int]
+
+class Thingy {
+	val buffer = Option[Buffer[Int]]
+}
+
+trait Allocator {
+	def allocate(size: Int): *Byte
+	def free(ptr: *Byte): Unit
+}
+
+namespace C extern "C" {
+	def malloc(size: USize): *Byte
+	def free(ptr: *Byte): Unit
+}
+
+object MallocAllocator extends Allocator {
+	def allocate(size: Int): *Byte = (: *Byte)C.malloc(size)
+	def free(ptr: *Byte): Unit = C.free(ptr)
+}
+
+def test(): Unit = {
+	val buf = Buffer[Buffer[Int]]
+	val embedded = Buffer[Int]
+
+	embedded += 1
+	embedded += 2
+	embedded += 3
+
+	buf += Buffer[Int]
+	if (condition) {
+		buf += embedded.copy
+	}
+
+	for (b <- buf) {
+	}
+
+}
+
+def accumulate(res: &Buffer[Int]) {
+	res += 1
+}
+
+def doThing() {
+	val buf = Buffer[Int]
+	accumulate(buf)
+}
+
