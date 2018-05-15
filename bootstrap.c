@@ -283,6 +283,7 @@ struct ast {
 			ast *ret;
 			ast *body;
 			unsigned mods;
+			bool no_parens;
 		} def;
 
 		struct {
@@ -313,7 +314,7 @@ struct ast {
 
 		struct {
 			token kind;
-			ast *name;
+			token name;
 			ast *type;
 			ast *init;
 			unsigned mods;
@@ -475,7 +476,7 @@ void error_at(compiler_state *s, token tok, const char *fmt, ...) {
 	s->errorline[0] = (char*)malloc(4096);
 	s->errorline[1] = (char*)malloc(4096);
 
-	char *ee = file->begin + tok.begin, *eb = ee;
+	const char *ee = file->begin + tok.begin, *eb = ee;
 	while (eb >= file->begin + 1 && eb[-1] != '\t' && eb[-1] != '\n' && eb[-1] != '\r') {
 		eb--;
 	}
@@ -486,9 +487,9 @@ void error_at(compiler_state *s, token tok, const char *fmt, ...) {
 	memcpy(s->errorline[0], eb, ee - eb);
 	s->errorline[0][ee - eb] = '\0';
 
-	char *tb = file->begin + tok.begin, *te = file->begin + tok.end;
+	const char *tb = file->begin + tok.begin, *te = file->begin + tok.end;
 	char *out = s->errorline[1];
-	for (char *ec = eb; ec < ee; ec++) {
+	for (const char *ec = eb; ec < ee; ec++) {
 		char c;
 		if (ec < tb || ec >= te) {
 			c = ' ';
@@ -772,6 +773,7 @@ ast *parse_type(compiler_state *s) {
 
 	case tok_identifier:
 		a = push_ast(s, ast_identifier);
+		a->identifier.name = s->prev_token;
 		while (accept(s, '[')) {
 			ast *gen = push_ast(s, ast_generic);
 			gen->generic.name = a;
@@ -887,8 +889,9 @@ ast *parse_free_statement(compiler_state *s) {
 	case tok_kw_var:
 	case tok_kw_val:
 		a = push_ast(s, ast_vardecl);
-		a->vardecl.name = parse_name(s);
 		a->vardecl.kind = s->prev_token;
+		require(s, tok_identifier, "Variable declaration name");
+		a->vardecl.name = s->prev_token;
 		if (accept(s, ':')) {
 			a->vardecl.type = parse_type(s);
 		}
@@ -909,20 +912,22 @@ ast *parse_free_statement(compiler_state *s) {
 	case tok_kw_def:
 		a = push_ast(s, ast_def);
 		a->def.name = parse_name(s);
-		require(s, '(', "Expected '(' for parameter list");
-		if (!accept(s, ')')) {
 
-			do {
-				ast *decl = push_ast(s, ast_decl);
-				require(s, tok_identifier, "Expected argument name");
-				decl->decl.name = s->prev_token;
-				if (!require(s, ':', "Expected parameter type")) return NULL;
-				decl->decl.type = parse_type(s);
-				buf_push(a->def.args, decl);
-			} while (accept(s, ','));
+		if (accept(s, '(')) {
+			if (!accept(s, ')')) {
+				do {
+					ast *decl = push_ast(s, ast_decl);
+					require(s, tok_identifier, "Expected argument name");
+					decl->decl.name = s->prev_token;
+					if (!require(s, ':', "Expected parameter type")) return NULL;
+					decl->decl.type = parse_type(s);
+					buf_push(a->def.args, decl);
+				} while (accept(s, ','));
 
-			require(s, ')', "Expected closing ')'");
-
+				require(s, ')', "Expected closing ')'");
+			}
+		} else {
+			a->def.no_parens = true;
 		}
 
 		if (accept(s, ':')) {
@@ -1024,6 +1029,186 @@ ast **parse(compiler_state *s) {
 	return stmts;
 }
 
+void dump_ast_mods(FILE *f, unsigned mods) {
+	if (mods & mod_inline) fputs("inline ", f);
+	if (mods & mod_unsafe) fputs("unsafe ", f);
+}
+
+void dump_ast_name(FILE *f, ast *a) {
+	switch (a->kind) {
+
+	case ast_identifier:
+		fputs(a->identifier.name.str, f);
+		break;
+
+	case ast_generic:
+		dump_ast_name(f, a->generic.name);
+		fputc('[', f);
+		for (unsigned i = 0; i < buf_len(a->generic.args); i++) {
+			if (i != 0) fputs(", ", f);
+			assert(a->generic.args[i]->kind == ast_identifier);
+			fputs(a->generic.args[i]->identifier.name.str, f);
+		}
+		fputc(']', f);
+		break;
+
+	default:
+		assert(0 && "Unexpected AST type");
+	}
+}
+
+void dump_ast_type(FILE *f, ast *a) {
+	switch (a->kind) {
+
+	case ast_identifier:
+		fputs(a->identifier.name.str, f);
+		break;
+
+	case ast_generic:
+		dump_ast_name(f, a->generic.name);
+		fputc('[', f);
+		for (unsigned i = 0; i < buf_len(a->generic.args); i++) {
+			if (i != 0) fputs(", ", f);
+			dump_ast_type(f, a->generic.args[i]);
+		}
+		fputc(']', f);
+		break;
+
+	case ast_ref:
+		fputc('*', f);
+		dump_ast_type(f, a->ref.decl);
+		break;
+
+	default:
+		assert(0 && "Unexpected AST type");
+	}
+}
+
+void dump_ast_decl(FILE *f, ast *a) {
+	assert(a->kind == ast_decl);
+
+	fputs(a->decl.name.str, f);
+	fputs(": ", f);
+	dump_ast_type(f, a->decl.type);
+}
+
+void dump_indent(FILE *f, int indent) {
+	for (int i = 0; i < indent * 2; i++) {
+		putc(' ', f);
+	}
+}
+
+void dump_ast_free_statement(FILE *f, int indent, ast* a) {
+	switch (a->kind) {
+
+	case ast_block:
+		fputs("{\n", f);
+		indent++;
+
+		for (unsigned i = 0; i < buf_len(a->block.stmts); i++) {
+			dump_indent(f, indent);
+			dump_ast_free_statement(f, indent, a->block.stmts[i]);
+			putc('\n', f);
+		}
+		indent--;
+
+		dump_indent(f, indent);
+		putc('}', f);
+		break;
+
+	case ast_typedecl:
+		dump_ast_mods(f, a->typedecl.mods);
+		fputs("type ", f);
+		dump_ast_name(f, a->typedecl.name);
+		break;
+
+	case ast_vardecl:
+		dump_ast_mods(f, a->vardecl.mods);
+		printf("%s %s", a->vardecl.kind.str, a->vardecl.name.str);
+		if (a->vardecl.type) {
+			fputs(": ", f);
+			dump_ast_type(f, a->vardecl.type);
+		}
+		break;
+
+	case ast_def:
+		fputs("def ", f);
+		dump_ast_name(f, a->def.name);
+		if (!a->def.no_parens) {
+			putc('(', f);
+			for (unsigned i = 0; i < buf_len(a->def.args); i++) {
+				if (i != 0) fputs(", ", f);
+				dump_ast_decl(f, a->def.args[i]);
+			}
+			putc(')', f);
+		}
+		if (a->def.ret) {
+			fputs(": ", f);
+			dump_ast_type(f, a->def.ret);
+		}
+		break;
+
+	case ast_type:
+		dump_ast_mods(f, a->type.mods);
+		printf("%s ", a->type.kind.str);
+		dump_ast_name(f, a->type.name);
+		putc(' ', f);
+		if (a->type.extends) {
+			fputs("extends ", f);
+			for (unsigned i = 0; i < buf_len(a->type.extends); i++) {
+				if (i != 0) fputs(", ", f);
+				dump_ast_type(f, a->type.extends[i]);
+			}
+			putc(' ', f);
+		}
+		fputs("{\n", f);
+		indent++;
+
+		for (unsigned i = 0; i < buf_len(a->type.stmts); i++) {
+			dump_indent(f, indent);
+			dump_ast_free_statement(f, indent, a->type.stmts[i]);
+			putc('\n', f);
+		}
+
+		indent--;
+		dump_indent(f, indent);
+		putc('}', f);
+
+		break;
+
+
+	default:
+		assert(0 && "Unexpected AST type");
+	}
+}
+
+void dump_ast_toplevel(FILE *f, int indent, ast *a) {
+	switch (a->kind) {
+
+	case ast_namespace:
+		fprintf(f, "namespace %s ", a->namespace_.name.str);
+		dump_ast_toplevel(f, indent, a->namespace_.stmt);
+		break;
+
+	case ast_extern:
+		fprintf(f, "extern %s ", a->extern_.format.str);
+		dump_ast_toplevel(f, indent, a->extern_.stmt);
+		break;
+
+	default:
+		dump_ast_free_statement(f, indent, a);
+		break;
+
+	}
+}
+
+void dump_ast(FILE *f, ast** a) {
+	for (unsigned i = 0; i < buf_len(a); i++) {
+		dump_ast_toplevel(f, 0, a[i]);
+		putc('\n', f);
+	}
+}
+
 void add_keyword(compiler_state *s, const char *name, unsigned kind) {
 	const char *interned = intern_str_zero(s, name);
 	map_set(&s->keywords, interned, (void*)(uintptr_t)kind);
@@ -1067,6 +1252,8 @@ int main(int argc, char **argv) {
 	if (s->error) {
 		printf("Error: %s\n", s->error);
 		printf("%s\n%s\n", s->errorline[0], s->errorline[1]);
+	} else {
+		dump_ast(stdout, as);
 	}
 
 	getchar();

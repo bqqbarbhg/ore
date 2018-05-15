@@ -24,17 +24,17 @@ struct Type {
 }
 
 trait Cast[T] {
-	def cast(): T
+	def cast: T
 }
 
 type Ptr[T]
 
 impl Ptr extends Cast[Ptr[R]] {
-	inline def cast(): Ptr[R]
+	inline def cast: Ptr[R]
 }
 
 impl Ptr extends Cast[*T] {
-	inline def cast(): *T
+	inline def cast: *T
 }
 
 
