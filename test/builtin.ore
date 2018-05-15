@@ -15,3 +15,34 @@ namespace builtin extern "Builtin" {
 	def moveFromRef(t: *T): T
 }
 
+def moveFromRef(t: *T): T
+
+inline def assert(cond: Bool): Unit
+
+struct Type {
+	var size: Int
+}
+
+trait Cast[T] {
+	def cast(): T
+}
+
+type Ptr[T]
+
+impl Ptr extends Cast[Ptr[R]] {
+	inline def cast(): Ptr[R]
+}
+
+impl Ptr extends Cast[*T] {
+	inline def cast(): *T
+}
+
+
+struct Seq[T] {
+	var data: Ptr[T]
+	var count: Int
+
+	inline def apply(index: Int): *T
+}
+
+

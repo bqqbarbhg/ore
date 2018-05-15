@@ -827,12 +827,21 @@ ast *parse_free_statement(compiler_state *s) {
 
 	} break;
 
+	case tok_kw_impl:
 	case tok_kw_trait:
 	case tok_kw_struct:
 	case tok_kw_class:
 		a = push_ast(s, ast_type);
 		a->type.kind = s->prev_token;
 		a->type.name = parse_name(s);
+
+		if (accept(s, tok_kw_extends)) {
+			do {
+				ast *b = parse_type(s);
+				buf_push(a->type.extends, b);
+			} while (accept(s, ','));
+		}
+
 		if (!require(s, '{', "Expected type declaration block '{'")) return NULL;
 		while (accept(s, '\n')) { }
 		while (!accept(s, '}') && !s->error) {
