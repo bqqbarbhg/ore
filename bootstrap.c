@@ -189,6 +189,7 @@ enum {
 	tok_kw_new,
 	tok_kw_impl,
 	tok_kw_extends,
+	tok_kw_sizeof,
 };
 
 typedef struct token {
@@ -198,20 +199,62 @@ typedef struct token {
 
 typedef enum ast_kind {
 	ast_invalid,
+
+	ast_namespace,
+	ast_extern,
+	ast_block,
 	ast_identifier,
 	ast_number,
+	ast_generic,
 	ast_decl,
-	ast_func,
-	ast_binop,
+	ast_ref,
+
+	ast_def,
+	ast_if,
+	ast_while,
+	ast_type,
+	ast_typedecl,
+	ast_vardecl,
+	ast_assign,
+
+	ast_member,
 	ast_call,
-	ast_toplevel,
+	ast_unop,
+	ast_binop,
+	ast_paren,
+	ast_new,
+	ast_sizeof,
+
 } ast_kind;
 
-typedef struct ast {
+enum {
+	mod_unsafe = 1 << 0,
+	mod_inline = 1 << 1,
+};
+
+typedef struct ast ast;
+
+struct ast {
 	ast_kind kind;
 	unsigned serial;
+	token token;
 
 	union {
+
+		struct {
+			token name;
+			ast *stmt;
+		} namespace_;
+
+		struct {
+			token format;
+			ast *stmt;
+		} extern_;
+
+		struct {
+			ast **stmts;
+		} block;
+
 		struct {
 			token name;
 		} identifier;
@@ -221,33 +264,101 @@ typedef struct ast {
 		} number;
 
 		struct {
-			token op;
-			struct ast *left, *right;
-		} binop;
-
-		struct {
-			token paren;
-			struct ast *func;
-			struct ast **args;
-		} call;
+			ast *name;
+			ast **args;
+		} generic;
 
 		struct {
 			token name;
-			struct ast *type;
+			ast *type;
 		} decl;
 
 		struct {
-			token name;
-			struct ast **arg_decls;
-			struct ast *ret_type;
-			struct ast *body;
-		} func;
+			ast *decl;
+		} ref;
 
 		struct {
-			struct ast **statements;
-		} toplevel;
+			ast *name;
+			ast **args;
+			ast *ret;
+			ast *body;
+			unsigned mods;
+		} def;
+
+		struct {
+			ast *cond;
+			ast *true_stmt;
+			ast *false_stmt;
+		} if_;
+
+		struct {
+			ast *cond;
+			ast *body;
+		} while_;
+
+		struct {
+			token kind;
+			ast *name;
+			ast **extends;
+			ast **stmts;
+			unsigned mods;
+		} type;
+
+		struct {
+			token kind;
+			ast *name;
+			ast *init;
+			unsigned mods;
+		} typedecl;
+
+		struct {
+			token kind;
+			ast *name;
+			ast *type;
+			ast *init;
+			unsigned mods;
+		} vardecl;
+
+		struct {
+			ast *lhs;
+			ast *rhs;
+		} assign;
+
+		struct {
+			ast *left;
+			ast *name;
+		} member;
+
+		struct {
+			ast *left;
+			ast **args;
+		} call;
+
+		struct {
+			token op;
+			ast *arg;
+		} unop;
+
+		struct {
+			token op;
+			ast *left, *right;
+		} binop;
+
+		struct {
+			ast *expr;
+		} paren;
+
+		struct {
+			ast *type;
+			ast **args;
+		} new_;
+
+		struct {
+			ast *type;
+		} sizeof_;
+
 	};
-} ast;
+};
 
 typedef struct compiler_state {
 	map strings;
@@ -256,7 +367,10 @@ typedef struct compiler_state {
 	file *files;
 	file *file;
 	char *error;
+	token prev_token;
 	token token;
+	token unlex_token;
+	bool unlex_state;
 
 	char *alloc;
 	size_t alloc_pos;
@@ -277,6 +391,34 @@ inl bool id_tail(char c) { return id_head(c) || range(c, "09"); }
 inl bool digit(char c) { return range(c, "09"); }
 
 #define array_len(arr) (sizeof(arr) / sizeof(*(arr)))
+
+void grow_allocator(compiler_state *s, size_t size) {
+	s->alloc_cap *= 2;
+	if (s->alloc_cap < 1024) s->alloc_cap = 1024;
+	if (s->alloc_cap < size) s->alloc_cap = size;
+	s->alloc = (char*)calloc(s->alloc_cap, 1);
+	s->alloc_pos = 0;
+}
+
+#define push_mem(s, type) (type*)push_memory((s), sizeof(type))
+
+inl void *push_memory(compiler_state *s, size_t size) {
+	size += ((8 - (size & 7)) & 7);
+	if (s->alloc_pos + size > s->alloc_cap) {
+		grow_allocator(s, size);
+	}
+	size_t pos = s->alloc_pos;
+	s->alloc_pos = pos + size;
+	return s->alloc + pos;
+}
+
+inl ast *push_ast(compiler_state *s, ast_kind kind) {
+	ast *a = push_mem(s, ast);
+	a->kind = kind;
+	a->serial = ++s->ast_serial;
+	a->token = s->prev_token;
+	return a;
+}
 
 void find_line_col(file *f, unsigned pos, unsigned *line, unsigned *col) {
 	unsigned count = buf_len(f->linebreaks), first = 0, step, it;
@@ -405,6 +547,13 @@ inl const char *intern_str_zero(compiler_state *s, const char *str) {
 void lex(compiler_state *s) {
 	if (s->error) return;
 
+	s->prev_token = s->token;
+	if (s->unlex_state) {
+		s->token = s->unlex_token;
+		s->unlex_state = false;
+		return;
+	}
+
 	char c = peek(s);
 
 	while (whitespace(c)) {
@@ -509,6 +658,330 @@ accept:
 	}
 }
 
+void unlex(compiler_state *s) {
+	s->unlex_token = s->token;
+	s->token = s->prev_token;
+	s->unlex_state = true;
+}
+
+inl bool accept(compiler_state *s, unsigned kind) {
+	if (s->token.kind == kind) {
+		lex(s);
+		return true;
+	}
+	else {
+		return false;
+	}
+}
+
+inl bool require(compiler_state *s, unsigned kind, const char *context) {
+	if (s->error) return false;
+
+	if (!accept(s, kind)) {
+		error_at(s, s->token, "%s", context);
+		return false;
+	}
+
+	return true;
+}
+
+unsigned token_to_mod(unsigned kind) {
+	switch (kind) {
+	case tok_kw_inline: return mod_inline;
+	case tok_kw_unsafe: return mod_unsafe;
+	default:
+		assert(0 && "Unexpected modifier kind");
+		return 0;
+	}
+}
+
+ast *parse_name(compiler_state *s) {
+	if (!require(s, tok_identifier, "Expected a name")) return NULL;
+	ast *id = push_ast(s, ast_identifier);
+	id->identifier.name = s->prev_token;
+
+	if (accept(s, '[')) {
+		ast *gen = push_ast(s, ast_generic);
+		gen->generic.name = id;
+
+		if (s->token.kind == ']') {
+			error_at(s, s->token, "Generic parameter list cannot be empty");
+			return NULL;
+		}
+
+		do {
+			require(s, tok_identifier, "Expected a generic argument name");
+			ast *arg = push_ast(s, ast_identifier);
+			arg->identifier.name = s->prev_token;
+			buf_push(gen->generic.args, arg);
+		} while (accept(s, ','));
+
+		require(s, ']', "Expected closing ']' after generic argument list");
+		return gen;
+	} else {
+		return id;
+	}
+}
+
+ast *parse_expr(compiler_state *s) {
+	return NULL;
+}
+
+ast *parse_type(compiler_state *s) {
+	ast *a = NULL;
+
+	lex(s);
+	switch (s->prev_token.kind) {
+
+	case '*':
+		a = push_ast(s, ast_ref);
+		a->ref.decl = parse_type(s);
+		break;
+
+	case tok_identifier:
+		a = push_ast(s, ast_identifier);
+		while (accept(s, '[')) {
+			ast *gen = push_ast(s, ast_generic);
+			gen->generic.name = a;
+
+			if (s->token.kind == ']') {
+				error_at(s, s->token, "Generic argument list cannot be empty");
+				return NULL;
+			}
+
+			do {
+				ast *arg = parse_type(s);
+				buf_push(gen->generic.args, arg);
+			} while (accept(s, ','));
+
+			require(s, ']', "Expected closing ']' after generic argument list");
+			a = gen;
+		}
+		break;
+
+	default:
+		error_at(s, s->prev_token, "Expected a type");
+		break;
+	}
+
+	return s->error ? NULL : a;
+}
+
+ast *parse_free_statement(compiler_state *s) {
+	if (s->error) return NULL;
+	ast *a = NULL;
+
+	lex(s);
+	token tok = s->prev_token;
+	switch (tok.kind) {
+
+	case tok_kw_inline:
+	case tok_kw_unsafe: {
+		unsigned mod = token_to_mod(tok.kind);
+		a = parse_free_statement(s);
+
+		switch (a->kind) {
+
+		case ast_type:
+			switch (tok.kind) {
+			case tok_kw_unsafe:
+				a->type.mods |= mod;
+				break;
+			default:
+				error_at(s, tok, "Cannot mark type as '%s'", tok.str);
+			}
+			break;
+
+		case ast_typedecl:
+			switch (tok.kind) {
+			case tok_kw_unsafe:
+				a->typedecl.mods |= mod;
+				break;
+			default: error_at(s, tok, "Cannot mark type as '%s'", tok.str);
+			}
+			break;
+
+		case ast_vardecl:
+			switch (tok.kind) {
+			case tok_kw_unsafe:
+				a->typedecl.mods |= mod;
+				break;
+			default: error_at(s, tok, "Cannot mark variable as '%s'", tok.str);
+			}
+			break;
+
+		case ast_def:
+			switch (tok.kind) {
+			case tok_kw_inline:
+			case tok_kw_unsafe:
+				a->def.mods |= mod;
+				break;
+			default: error_at(s, tok, "Cannot mark function definition as '%s'", tok.str);
+			}
+			break;
+
+		default:
+			error_at(s, tok, "Cannot mark non-declaration as '%s'", tok.str);
+			return NULL;
+		}
+
+	} break;
+
+	case tok_kw_trait:
+	case tok_kw_struct:
+	case tok_kw_class:
+		a = push_ast(s, ast_type);
+		a->type.kind = s->prev_token;
+		a->type.name = parse_name(s);
+		if (!require(s, '{', "Expected type declaration block '{'")) return NULL;
+		while (accept(s, '\n')) { }
+		while (!accept(s, '}') && !s->error) {
+			ast *b = parse_free_statement(s);
+			buf_push(a->type.stmts, b);
+			while (accept(s, '\n')) { }
+		}
+		break;
+
+	case tok_kw_var:
+	case tok_kw_val:
+		a = push_ast(s, ast_vardecl);
+		a->vardecl.name = parse_name(s);
+		a->vardecl.kind = s->prev_token;
+		if (accept(s, ':')) {
+			a->vardecl.type = parse_type(s);
+		}
+		if (accept(s, '=')) {
+			a->vardecl.init = parse_expr(s);
+		}
+		break;
+
+	case tok_kw_type:
+		a = push_ast(s, ast_typedecl);
+		a->typedecl.name = parse_name(s);
+		a->typedecl.kind = s->prev_token;
+		if (accept(s, '=')) {
+			a->typedecl.init = parse_type(s);
+		}
+		break;
+
+	case tok_kw_def:
+		a = push_ast(s, ast_def);
+		a->def.name = parse_name(s);
+		require(s, '(', "Expected '(' for parameter list");
+		if (!accept(s, ')')) {
+
+			do {
+				ast *decl = push_ast(s, ast_decl);
+				require(s, tok_identifier, "Expected argument name");
+				decl->decl.name = s->prev_token;
+				if (!require(s, ':', "Expected parameter type")) return NULL;
+				decl->decl.type = parse_type(s);
+				buf_push(a->def.args, decl);
+			} while (accept(s, ','));
+
+			require(s, ')', "Expected closing ')'");
+
+		}
+
+		if (accept(s, ':')) {
+			a->def.ret = parse_type(s);
+		}
+		break;
+
+	case '{':
+		a = push_ast(s, ast_block);
+		while (accept(s, '\n')) { }
+		while (!accept(s, '}') && !s->error) {
+			ast *st = parse_free_statement(s);
+			if (st != NULL) {
+				buf_push(a->block.stmts, st);
+			} else if (!s->error) {
+				error_at(s, s->prev_token, "Expected a free statement");
+			}
+			while (accept(s, '\n')) { }
+		}
+		break;
+
+	default:
+		unlex(s);
+		return NULL;
+
+	}
+
+	return s->error ? NULL : a;
+}
+
+ast *parse_statement(compiler_state *s) {
+	if (s->error) return NULL;
+	ast *a = NULL;
+
+	lex(s);
+	switch (s->prev_token.kind) {
+
+	case tok_kw_if:
+		break;
+
+	default:
+		a = parse_free_statement(s);
+		if (a == NULL && !s->error) {
+			a = parse_expr(s);
+		}
+
+	}
+
+
+	return s->error ? NULL : a;
+}
+
+ast *parse_toplevel(compiler_state *s) {
+	if (s->error) return NULL;
+	ast *a = NULL;
+
+	lex(s);
+	switch (s->prev_token.kind) {
+
+	case tok_kw_namespace:
+		a = push_ast(s, ast_namespace);
+		if (!require(s, tok_identifier, "Namespace name identifier")) return NULL;
+		a->namespace_.name = s->prev_token;
+		a->namespace_.stmt = parse_toplevel(s);
+		break;
+
+	case tok_kw_extern:
+		a = push_ast(s, ast_extern);
+		if (!require(s, tok_string, "Extern context name string")) return NULL;
+		a->extern_.format = s->prev_token;
+		a->extern_.stmt = parse_toplevel(s);
+		break;
+
+	default:
+		unlex(s);
+		a = parse_free_statement(s);
+		if (a == NULL && !s->error) {
+			error_at(s, s->prev_token, "Expected a free statement");
+		}
+		break;
+	}
+
+	return s->error ? NULL : a;
+}
+
+ast **parse(compiler_state *s) {
+	ast **stmts = NULL;
+
+	lex(s);
+
+	while (accept(s, '\n')) { }
+	while (!accept(s, tok_end) && !s->error) {
+		ast *a = parse_toplevel(s);
+		buf_push(stmts, a);
+
+		while (accept(s, '\n')) { }
+	}
+
+	return stmts;
+}
+
 void add_keyword(compiler_state *s, const char *name, unsigned kind) {
 	const char *interned = intern_str_zero(s, name);
 	map_set(&s->keywords, interned, (void*)(uintptr_t)kind);
@@ -538,6 +1011,7 @@ void init_compiler(compiler_state *s) {
 	add_keyword(s, "new", tok_kw_new);
 	add_keyword(s, "impl", tok_kw_impl);
 	add_keyword(s, "extends", tok_kw_extends);
+	add_keyword(s, "sizeof", tok_kw_sizeof);
 }
 
 int main(int argc, char **argv) {
@@ -546,10 +1020,7 @@ int main(int argc, char **argv) {
 	init_compiler(s);
 	push_file(s, argv[1]);
 
-	do {
-		lex(s);
-		printf("%s: %d\n", s->token.str, s->token.kind);
-	} while (!s->error && s->token.kind != tok_end);
+	ast **as = parse(s);
 
 	if (s->error) {
 		printf("Error: %s\n", s->error);

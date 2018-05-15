@@ -3,7 +3,6 @@ namespace builtin extern "Builtin" {
 	type Unit
 	type Int
 
-	type BuiltinArray[T: Type, N: Int]
 	type Pointer[T]
 
 	def castPointer[From, To](ptr: Pointer[From]): Pointer[To]
@@ -27,14 +26,14 @@ inline def assert(cond: Bool): Unit = {
 }
 
 struct Type {
-	size: Int
+	var size: Int
 }
 
-trait Cast[T: Type] {
+trait Cast[T] {
 	def cast: T
 }
 
-type Ptr[T: Type] = builtin.Pointer[T]
+type Ptr[T] = builtin.Pointer[T]
 
 impl Ptr extends Cast[Ptr[R]] {
 	inline def cast: Ptr[R] = builtin.castPointer[T, R](this)
@@ -44,23 +43,9 @@ impl Ptr extends Cast[*T] {
 	inline def cast: *T = builtin.pointerToRef[T](this)
 }
 
-struct Seq[T: Type] {
+struct Seq[T] {
 	var data: Ptr[T]
 	var count: Int
-
-	inline def apply(index: Int): *T = {
-		assert(index < count)
-		(data + index).cast
-	}
-}
-
-unsafe struct UnsafeArray[T: Type, N: Int] extends Cast[Seq[T]] {
-	val storage: builtin.BuiltinArray[T, N]
-
-	def data: Ptr[T] = storage.pointer
-	def count: Int = T
-
-	def cast: Seq[T] = new { data, count }
 
 	inline def apply(index: Int): *T = {
 		assert(index < count)
@@ -72,7 +57,7 @@ def min[T](a: T, b: T): T = if (a < b) a else b
 def max[T](a: T, b: T): T = if (a > b) a else b
 
 def allocSeq[T](num: Int): Seq[T] = {
-	val ptr = builtin.alloc(T.size)
+	val ptr = builtin.alloc(sizeof(T))
 	new { ptr.cast, num }
 }
 
@@ -80,26 +65,15 @@ def freeSeq[T](seq: Seq[T]) {
 	builtin.free(seq.data.cast)
 }
 
-class Buffer[T: Type] unsafe {
-	var data: Seq[T] = internal
+class Buffer[T] {
+	var data: Seq[T] = new { count = 0 }
 	var count: Int = 0
-	var internal: UnsafeArray[T, 16]
-
-	unsafe def moveFrom(src: T) {
-		if (src.data.data == src.internal.data) {
-			data = internal
-			count = src.count
-			for (i <- 0 until count) {
-				internal(i).moveFrom(moveFromRef(src.internal(i)))
-			}
-		} else {
-			*this = *src
-		}
-	}
 
 	def free() {
-		for (i <- 0 until count) {
+		var ix = 0
+		while (ix < count) {
 			data(i).free()
+			ix += 1
 		}
 
 		if (data.data != internal.data) {
@@ -110,8 +84,10 @@ class Buffer[T: Type] unsafe {
 	def grow(minCap: Int) {
 		val cap = max(data.count * 2, minCap)
 		val newData = allocSeq(cap)
-		for (i <- 0 until count) {
-			newData(i).moveFrom(moveFromRef(data(i)))
+		var ix = 0
+		while (ix < count) {
+			newData(ix).moveFrom(moveFromRef(data(ix)))
+			ix += 1
 		}
 		if (data.data != internal.data)
 			freeSeq(data)

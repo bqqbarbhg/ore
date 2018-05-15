@@ -1,0 +1,17 @@
+
+namespace builtin extern "Builtin" {
+	type Unit
+	type Int
+
+	type Pointer[T]
+
+	def castPointer[From, To](ptr: Pointer[From]): Pointer[To]
+	def pointerToRef[T](ptr: Pointer[T]): *T
+
+	def alloc(size: Int): Ptr[Byte]
+	def free(ptr: Ptr[Byte]): Unit
+
+	def assertFail(): Unit
+	def moveFromRef(t: *T): T
+}
+
