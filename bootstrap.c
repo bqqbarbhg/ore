@@ -367,6 +367,7 @@ typedef struct compiler_state {
 	file *files;
 	file *file;
 	char *error;
+	char *errorline[2];
 	token prev_token;
 	token token;
 	token unlex_token;
@@ -437,11 +438,11 @@ void find_line_col(file *f, unsigned pos, unsigned *line, unsigned *col) {
 	*line = first;
 	if (first == 0) {
 		*col = pos;
-	}
-	else if (first < buf_len(f->linebreaks)) {
+	} else if (first < buf_len(f->linebreaks)) {
 		*col = pos - f->linebreaks[first];
-	}
-	else {
+	} else if (buf_len(f->linebreaks) > 0) {
+		*col = pos - f->linebreaks[buf_len(f->linebreaks) - 1];
+	} else {
 		*col = 0;
 	}
 }
@@ -456,6 +457,8 @@ void error_global(compiler_state *s, const char *fmt, ...) {
 }
 
 void error_at(compiler_state *s, token tok, const char *fmt, ...) {
+	if (s->error) return;
+
 	char msg[1024], *res = (char*)malloc(4096);
 	file *file = &s->files[tok.file];
 	unsigned line, col;
@@ -468,6 +471,35 @@ void error_at(compiler_state *s, token tok, const char *fmt, ...) {
 
 	sprintf(res, "%s:%d:%d: %s", file->name, line + 1, col + 1, msg);
 	s->error = res;
+
+	s->errorline[0] = (char*)malloc(4096);
+	s->errorline[1] = (char*)malloc(4096);
+
+	char *ee = file->begin + tok.begin, *eb = ee;
+	while (eb >= file->begin + 1 && eb[-1] != '\t' && eb[-1] != '\n' && eb[-1] != '\r') {
+		eb--;
+	}
+	while (ee < file->end && *ee != '\n' && *ee != '\r') {
+		ee++;
+	}
+
+	memcpy(s->errorline[0], eb, ee - eb);
+	s->errorline[0][ee - eb] = '\0';
+
+	char *tb = file->begin + tok.begin, *te = file->begin + tok.end;
+	char *out = s->errorline[1];
+	for (char *ec = eb; ec < ee; ec++) {
+		char c;
+		if (ec < tb || ec >= te) {
+			c = ' ';
+		} else if (ec == tb || ec == te - 1) {
+			c = '^';
+		} else {
+			c = '~';
+		}
+		*out++ = c;
+	}
+	*out++ = '\0';
 }
 
 void push_file(compiler_state *s, const char *filename) {
@@ -779,6 +811,7 @@ ast *parse_free_statement(compiler_state *s) {
 	case tok_kw_unsafe: {
 		unsigned mod = token_to_mod(tok.kind);
 		a = parse_free_statement(s);
+		if (a == NULL) return NULL;
 
 		switch (a->kind) {
 
@@ -1033,6 +1066,7 @@ int main(int argc, char **argv) {
 
 	if (s->error) {
 		printf("Error: %s\n", s->error);
+		printf("%s\n%s\n", s->errorline[0], s->errorline[1]);
 	}
 
 	getchar();
