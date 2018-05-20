@@ -13,11 +13,21 @@ namespace builtin extern "Builtin" {
 
 	def assertFail(): Unit
 	def moveFromRef(t: *T): T
+
+	def typeInfo[T]: *TypeInfo
 }
 
-def moveFromRef(t: *T): T
+struct TypeInfo {
+	var size: Int
+}
 
-inline def assert(cond: Bool): Unit
+def moveFromRef(t: *T): T = builtin.moveFromRef(t)
+
+inline def assert(cond: Bool): Unit = {
+	if (!cond) {
+		builtin.assertFail()
+	}
+}
 
 struct Type {
 	var size: Int
@@ -27,22 +37,95 @@ trait Cast[T] {
 	def cast: T
 }
 
-type Ptr[T]
+type Ptr[T] = builtin.Pointer[T]
 
 impl Ptr extends Cast[Ptr[R]] {
-	inline def cast: Ptr[R]
+	inline def cast: Ptr[R] = builtin.castPointer[T, R](this)
 }
 
 impl Ptr extends Cast[*T] {
-	inline def cast: *T
+	inline def cast: *T = builtin.pointerToRef[T](this)
 }
-
 
 struct Seq[T] {
 	var data: Ptr[T]
 	var count: Int
 
-	inline def apply(index: Int): *T
+	inline def apply(index: Int): *T = {
+		assert(index < count)
+		(data + index).cast
+	}
 }
 
+inline def min[T](a: T, b: T): T = if (a < b) a else b
+inline def max[T](a: T, b: T): T = if (a > b) a else b
+
+inline def sizeOf[T]: Int = typeInfo[T].size
+
+def allocSeq[T](num: Int): Seq[T] = {
+	val ptr = builtin.alloc(sizeOf[T] * num)
+	new { ptr.cast, num }
+}
+
+def freeSeq[T](seq: Seq[T]) {
+	builtin.free(seq.data.cast)
+}
+
+class Buffer[T] {
+	var data: Seq[T] = new { count = 0 }
+	var count: Int = 0
+
+	def free() {
+		var ix = 0
+		while (ix < count) {
+			data(i).free()
+			ix += 1
+		}
+
+		if (data.data != internal.data) {
+			freeSeq(data)
+		}
+	}
+
+	def grow(minCap: Int) {
+		val cap = max(data.count * 2, minCap)
+		val newData = allocSeq(cap)
+		var ix = 0
+		while (ix < count) {
+			newData(ix).moveFrom(moveFromRef(data(ix)))
+			ix += 1
+		}
+		if (data.data != internal.data)
+			freeSeq(data)
+		data = newData
+	}
+
+	def push(value: T) {
+		if (count >= data.count) {
+			grow(count + 1)
+		}
+		data(count).moveFrom(value)
+		count += 1
+	}
+
+	def apply(index: Int): *T = data(index)
+	def update(index: Int, value: T) {
+		data(index).free()
+		data(index).moveFrom(value)
+	}
+
+}
+
+def main() {
+	val bufA = new Buffer[Int]
+	val bufB = new Buffer[Int]
+	val bufBuf = new Buffer[Buffer[Int]]
+
+	bufA.push(1)
+	bufB.push(2)
+	bufA.push(3)
+
+	bufBuf.push(move(bufA))
+	bufBuf.push(move(bufB))
+}
 
