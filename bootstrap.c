@@ -1525,7 +1525,6 @@ void dump_ast_expr(FILE *f, int indent, ast* a) {
 		break;
 
 	case ast_if:
-
 		for (unsigned i = 0; i < buf_len(a->if_.conds); i++) {
 			if (i > 0) {
 				putc('\n', f);
@@ -1544,7 +1543,6 @@ void dump_ast_expr(FILE *f, int indent, ast* a) {
 			fputs("else ", f);
 			dump_ast_expr(f, indent, a->if_.else_body);
 		}
-
 		break;
 
 	case ast_while:
