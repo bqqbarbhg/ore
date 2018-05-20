@@ -368,6 +368,101 @@ struct ast {
 	};
 };
 
+typedef enum type_kind {
+	type_ref,
+	type_builtin,
+	type_struct,
+	type_alias,
+	type_argument,
+	type_generic,
+} type_kind;
+
+typedef enum type_desc_kind {
+	type_desc_ref,
+	type_desc_generic,
+} type_desc_kind;
+
+typedef enum decl_state {
+	decl_unresolved,
+	decl_resolving,
+	decl_resolved,
+	decl_sized,
+} decl_state;
+
+typedef struct type type;
+typedef struct context context;
+
+typedef struct struct_member {
+	token name;
+	type *type;
+	unsigned offset;
+} struct_member;
+
+typedef struct type_desc {
+	type_desc_kind kind;
+
+	union {
+		struct {
+			type *type;
+		} ref;
+
+		struct {
+			type *proto;
+			type **args;
+		} generic;
+	};
+} type_desc;
+
+struct type {
+	type_kind kind;
+	decl_state state;
+	unsigned size, align;
+
+	context *definition_context;
+
+	ast *generic_def;
+	context *generic_context;
+
+	ast *definition;
+
+	const char *name;
+	token token;
+	unsigned serial;
+
+	union {
+		struct {
+			type *type;
+		} ref;
+
+		struct {
+			context *member_context;
+			struct_member *members;
+		} struct_;
+
+		struct {
+			type *type;
+		} alias;
+
+		struct {
+			type *parent;
+			unsigned index;
+		} argument;
+
+		struct {
+			type *proto;
+			type **args;
+		} generic;
+	};
+};
+
+struct context {
+	const char *name;
+	context *parent;
+	map values;
+	map types;
+	map namespaces;
+};
+
 typedef struct compiler_state {
 	map strings;
 	map types;
@@ -385,9 +480,15 @@ typedef struct compiler_state {
 	size_t alloc_pos;
 	size_t alloc_cap;
 
-	unsigned ast_serial;
+	unsigned serial_counter;
 
 	map keywords;
+	map type_descs;
+
+	context root;
+	context *ctx;
+
+	type **types_to_resolve;
 } compiler_state;
 
 inl char peek(compiler_state *s) { file *f = s->file; return f->pos != f->end ? *f->pos : '\0'; }
@@ -424,9 +525,18 @@ inl void *push_memory(compiler_state *s, size_t size) {
 inl ast *push_ast(compiler_state *s, ast_kind kind) {
 	ast *a = push_mem(s, ast);
 	a->kind = kind;
-	a->serial = ++s->ast_serial;
+	a->serial = ++s->serial_counter;
 	a->token = s->prev_token;
 	return a;
+}
+
+inl type *push_type(compiler_state *s, type_kind kind, token token) {
+	type *t = push_mem(s, type);
+	t->kind = kind;
+	t->serial = ++s->serial_counter;
+	t->token = token;
+	t->definition_context = s->ctx;
+	return t;
 }
 
 void find_line_col(file *f, unsigned pos, unsigned *line, unsigned *col) {
@@ -1264,6 +1374,11 @@ ast *parse_free_statement(compiler_state *s) {
 		if (accept(s, '=')) {
 			a->vardecl.init = parse_expr(s);
 		}
+
+		if (!a->vardecl.type && !a->vardecl.init) {
+			error_at(s, a->token, "Declaration for '%s' has no initializer or type", a->vardecl.name.str);
+		}
+
 		break;
 
 	case tok_kw_type:
@@ -1763,6 +1878,427 @@ void dump_ast(FILE *f, ast** a) {
 	}
 }
 
+bool type_desc_equal(void *va, void *vb) {
+	type_desc *a = (type_desc*)va, *b = (type_desc*)vb;
+	if (a->kind != b->kind) return false;
+	switch (a->kind) {
+	case type_desc_ref:
+		return a->ref.type == b->ref.type;
+
+	case type_desc_generic: {
+		if (a->generic.proto != b->generic.proto) return false;
+		unsigned len = buf_len(a->generic.args);
+		if (len != buf_len(b->generic.args)) return false;
+		return !memcmp(a->generic.args, b->generic.args, len * sizeof(type*));
+	}
+
+	default:
+		assert(0 && "Unexpected type desc kind");
+		return false;
+	}
+}
+
+unsigned type_desc_hash(void *va) {
+	type_desc *a = (type_desc*)va;
+	unsigned hash = 0;
+
+	hash = hash * 16777619U ^ a->kind;
+
+	switch (a->kind) {
+	case type_desc_ref:
+		hash = hash * 16777619U ^ (unsigned)((uintptr_t)a->ref.type >> 2);
+		break;
+
+	case type_desc_generic: {
+		unsigned len = buf_len(a->generic.args);
+		hash = hash * 16777619U ^ (unsigned)((uintptr_t)a->generic.proto >> 2);
+		hash = hash * 16777619U ^ len;
+		for (unsigned i = 0; i < len; i++) {
+			hash = hash * 16777619U ^ (unsigned)((uintptr_t)a->generic.args[i] >> 2);
+		}
+	} break;
+
+	default:
+		assert(0 && "Unexpected type desc kind");
+		return false;
+	}
+
+	return hash;
+}
+
+void init_context(context *c, context *parent, const char *name) {
+	memset(c, 0, sizeof(context));
+	c->name = name;
+	c->parent = parent;
+	c->types.hash_fn = identifier_hash;
+	c->types.equal_fn = identifier_equal;
+	c->values.hash_fn = identifier_hash;
+	c->values.equal_fn = identifier_equal;
+	c->namespaces.hash_fn = identifier_hash;
+	c->namespaces.equal_fn = identifier_equal;
+}
+
+context *lookup_context(context *c, const char *name) {
+	for (; c; c = c->parent) {
+		context *t = (context*)map_get(&c->namespaces, name);
+		if (t) return t;
+	} 
+	return NULL;
+}
+
+context *lookup_context_ast(context *c, ast *a) {
+	switch (a->kind) {
+
+	case ast_identifier:
+		return lookup_context(c, a->identifier.name.str);
+
+	case ast_member: {
+		context *inner = lookup_context_ast(c, a->member.left);
+		return (context*)map_get(&inner->namespaces, a->member.name.str);
+	} break;
+
+	default:
+		assert(0 && "Unexpected AST kind");
+		return NULL;
+	}
+}
+
+type *lookup_type(context *c, const char *name) {
+	for (; c; c = c->parent) {
+		type *t = (type*)map_get(&c->types, name);
+		if (t) return t;
+	} 
+	return NULL;
+}
+
+type *lookup_type_ast(context *c, ast *a) {
+	switch (a->kind) {
+
+	case ast_identifier:
+		return lookup_type(c, a->identifier.name.str);
+
+	case ast_member: {
+		context *inner = lookup_context_ast(c, a->member.left);
+		return (type*)map_get(&inner->types, a->member.name.str);
+	} break;
+
+	default:
+		assert(0 && "Unexpected AST kind");
+		return NULL;
+	}
+}
+
+void define_type(compiler_state *s, token name, type *type) {
+	if (map_get(&s->ctx->types, name.str)) {
+		error_at(s, name, "Type name '%s' is already defined", name.str);
+		return;
+	}
+
+	map_set(&s->ctx->types, name.str, type);
+}
+
+void collect_types_stmt(compiler_state *s, ast *a) {
+	switch (a->kind) {
+
+	case ast_block:
+		for (unsigned i = 0; i < buf_len(a->block.stmts); i++) {
+			collect_types_stmt(s, a->block.stmts[i]);
+		}
+		break;
+
+	case ast_namespace: {
+		context *prev = s->ctx;
+		context *ns = map_get(&s->ctx->namespaces, a->namespace_.name.str);
+
+		if (!ns) {
+			ns = push_mem(s, context);
+			init_context(ns, prev, a->namespace_.name.str);
+			map_set(&s->ctx->namespaces, a->namespace_.name.str, ns);
+		}
+
+		s->ctx = ns;
+		collect_types_stmt(s, a->namespace_.stmt);
+		s->ctx = prev;
+	} break;
+
+	case ast_typedecl: {
+		type *t = push_type(s, type_alias, a->token);
+		ast *name = a->typedecl.name;
+		if (name->kind == ast_generic) {
+			t->generic_def = name;
+			name = name->generic.name;
+		}
+		assert(name->kind == ast_identifier);
+
+		t->definition = a;
+		t->name = name->identifier.name.str;
+		define_type(s, name->identifier.name, t);
+		buf_push(s->types_to_resolve, t);
+	} break;
+
+	case ast_type: {
+
+		switch (a->type.kind.kind) {
+
+		case tok_kw_struct:
+		case tok_kw_class: {
+			type *t = push_type(s, type_struct, a->token);
+			ast *name = a->type.name;
+			if (name->kind == ast_generic) {
+				t->generic_def = name;
+				name = name->generic.name;
+			}
+			assert(name->kind == ast_identifier);
+
+			t->definition = a;
+			t->name = name->identifier.name.str;
+			define_type(s, name->identifier.name, t);
+			buf_push(s->types_to_resolve, t);
+		} break;
+
+		}
+
+	} break;
+
+	}
+}
+
+type *type_from_ast(compiler_state *s, ast *a) {
+	type *t = NULL;
+
+	switch (a->kind) {
+
+	case ast_ref: {
+		type *it = type_from_ast(s, a->ref.decl);
+		if (!it) return NULL;
+
+		type_desc td;
+		memset(&td, 0, sizeof(td));
+		td.kind = type_desc_ref;
+		td.ref.type = it;
+
+		unsigned ix;
+		if (map_insert(&s->type_descs, &td, &ix)) {
+			type *typ = push_type(s, type_ref, a->token);
+			typ->state = decl_sized;
+			typ->size = 8;
+			typ->align = 8;
+			typ->definition = a;
+
+			size_t len = strlen(it->name);
+			char *name = (char*)push_memory(s, len + 2);
+			name[0] = '*';
+			memcpy(name + 1, it->name + 1, len);
+			name[len + 1] = '\0';
+			typ->name = name;
+
+			typ->ref.type = it;
+
+			type_desc *pt = push_mem(s, type_desc);
+			memcpy(pt, &td, sizeof(type_desc));
+			s->type_descs.key_vals[ix].key = pt;
+			s->type_descs.key_vals[ix].val = typ;
+		}
+
+		return (type*)s->type_descs.key_vals[ix].val;
+	} break;
+
+	case ast_generic: {
+		type *it = type_from_ast(s, a->generic.name);
+		if (!it) return NULL;
+
+		type_desc td;
+		memset(&td, 0, sizeof(td));
+		td.kind = type_desc_generic;
+		td.generic.proto = it;
+
+		for (unsigned i = 0; i < buf_len(a->generic.args); i++) {
+			ast *arg = a->generic.args[i];
+			type *at = type_from_ast(s, arg);
+			if (!at) return NULL;
+
+			buf_push(td.generic.args, at);
+		}
+
+		unsigned ix;
+		if (map_insert(&s->type_descs, &td, &ix)) {
+			type *typ = push_type(s, type_generic, a->token);
+			typ->state = decl_resolved;
+			typ->definition = a;
+
+			typ->generic.proto = td.generic.proto;
+			typ->generic.args = td.generic.args;
+
+			char local_buf[1024], *p = local_buf, *e = p + sizeof(local_buf);
+
+			p += snprintf(p, e - p, "%s[", typ->generic.proto->name);
+			for (unsigned i = 0; i < buf_len(typ->generic.args); i++) {
+				type *arg = typ->generic.args[i];
+				if (i > 0) p += snprintf(p, e - p, ", ");
+				p += snprintf(p, e - p, "%s", arg->name);
+			}
+			p += snprintf(p, e - p, "]");
+
+			size_t len = p - local_buf;
+			char *name = push_memory(s, len);
+			memcpy(name, local_buf, len);
+			name[len] = '\0';
+			typ->name = name;
+
+			type_desc *pt = push_mem(s, type_desc);
+			memcpy(pt, &td, sizeof(type_desc));
+			s->type_descs.key_vals[ix].key = pt;
+			s->type_descs.key_vals[ix].val = typ;
+		}
+
+		return (type*)s->type_descs.key_vals[ix].val;
+	} break;
+
+	case ast_identifier:
+	case ast_member:
+		t = lookup_type_ast(s->ctx, a);
+		if (t == NULL) {
+			error_at(s, a->token, "Type not found");
+		}
+		break;
+
+	default:
+		assert(0 && "Unexpected AST kind");
+
+	}
+
+	return s->error ? NULL : t;
+}
+
+bool type_compatible(compiler_state *s, type *a, type *b) {
+	return true;
+}
+
+type *typecheck_expr(compiler_state *s, ast *a, type *expected) {
+	assert(0);
+	return NULL;
+}
+
+void resolve_struct_stmt(compiler_state *s, type *typ, ast *a) {
+	switch (a->kind) {
+
+	case ast_vardecl: {
+		token name = a->vardecl.name;
+		if (map_get(&typ->struct_.member_context->values, name.str)) {
+			error_at(s, name, "Struct already has a member named '%s'", name.str);
+			return;
+		}
+
+		struct_member *sm = buf_bump(typ->struct_.members);
+		sm->name = name;
+		if (a->vardecl.type) {
+			sm->type = type_from_ast(s, a->vardecl.type);
+		}
+
+		if (a->vardecl.init) {
+			type *t = typecheck_expr(s, a->vardecl.init, sm->type);
+			if (sm->type) {
+				if (!type_compatible(s, sm->type, t)) {
+					error_at(s, name, "Initializer type '%s' is incompatible with declared type '%s'", t->name, sm->type->name);
+					return;
+				}
+			} else {
+				sm->type = t;
+			}
+		}
+
+		if (s->error) return;
+		assert(sm->type != NULL);
+	} break;
+
+	default:
+		assert(0 && "Unexpected AST kind");
+
+	}
+}
+
+bool resolve_type(compiler_state *s, type *typ) {
+	if (typ->state == decl_resolved) return true;
+	if (typ->state == decl_resolving) {
+		error_at(s, typ->token, "Recursive typ definition '%s'", typ->name);
+		return false;
+	}
+	typ->state = decl_resolving;
+
+	context *prev_ctx = s->ctx;
+
+	s->ctx = typ->definition_context;
+
+	ast *gen = typ->generic_def;
+	if (gen) {
+		typ->generic_context = push_mem(s, context);
+		init_context(typ->generic_context, s->ctx, "(Generic args)");
+		s->ctx = typ->generic_context;
+
+		for (unsigned i = 0; i < buf_len(gen->generic.args); i++) {
+			ast *arg = gen->generic.args[i];
+			assert(arg->kind == ast_identifier);
+
+			type *arg_t = push_type(s, type_argument, arg->token);
+			arg_t->state = decl_resolved;
+			arg_t->name = arg->identifier.name.str;
+			arg_t->definition = arg;
+			arg_t->argument.parent = typ;
+			arg_t->argument.index = i;
+
+			define_type(s, arg->identifier.name, arg_t);
+		}
+	}
+
+	ast *a = typ->definition;
+	switch (a->kind) {
+
+	case ast_typedecl: {
+		typ->alias.type = type_from_ast(s, a->typedecl.init);
+	} break;
+
+	case ast_type: {
+
+		switch (a->type.kind.kind) {
+
+		case tok_kw_struct:
+		case tok_kw_class: {
+			typ->struct_.member_context = push_mem(s, context);
+			init_context(typ->struct_.member_context, s->ctx, typ->name);
+			s->ctx = typ->struct_.member_context;
+
+			for (unsigned i = 0; i < buf_len(a->type.stmts); i++) {
+				resolve_struct_stmt(s, typ, a->type.stmts[i]);
+			}
+
+			s->ctx = s->ctx->parent;
+		} break;
+
+		}
+
+	} break;
+
+	}
+
+	s->ctx = prev_ctx;
+	typ->state = decl_resolved;
+	return !s->error;
+}
+
+void resolve_types(compiler_state *s) {
+	for (unsigned i = 0; i < buf_len(s->types_to_resolve); i++) {
+		type *t = s->types_to_resolve[i];
+		resolve_type(s, t);
+		if (s->error) return;
+	}
+}
+
+void collect_types(compiler_state *s, ast **a) {
+	for (unsigned i = 0; i < buf_len(a); i++) {
+		collect_types_stmt(s, a[i]);
+	}
+}
+
 void add_keyword(compiler_state *s, const char *name, unsigned kind) {
 	const char *interned = intern_str_zero(s, name);
 	map_set(&s->keywords, interned, (void*)(uintptr_t)kind);
@@ -1774,6 +2310,8 @@ void init_compiler(compiler_state *s) {
 	s->strings.equal_fn = string_span_equal;
 	s->keywords.hash_fn = identifier_hash;
 	s->keywords.equal_fn = identifier_equal;
+	s->type_descs.hash_fn = type_desc_hash;
+	s->type_descs.equal_fn = type_desc_equal;
 
 	add_keyword(s, "if", tok_kw_if);
 	add_keyword(s, "else", tok_kw_else);
@@ -1793,6 +2331,9 @@ void init_compiler(compiler_state *s) {
 	add_keyword(s, "new", tok_kw_new);
 	add_keyword(s, "impl", tok_kw_impl);
 	add_keyword(s, "extends", tok_kw_extends);
+
+	init_context(&s->root, NULL, "(Root)");
+	s->ctx = &s->root;
 }
 
 int main(int argc, char **argv) {
@@ -1803,11 +2344,19 @@ int main(int argc, char **argv) {
 
 	ast **as = parse(s);
 
+	collect_types(s, as);
+	resolve_types(s);
+
 	if (s->error) {
 		printf("Error: %s\n", s->error);
 		printf("%s\n%s\n", s->errorline[0], s->errorline[1]);
 	} else {
 		dump_ast(stdout, as);
+
+		for (unsigned i = 0; i < buf_len(s->types_to_resolve); i++) {
+			type *t = s->types_to_resolve[i];
+			printf("> %s %s\n", t->definition->token.str, t->name);
+		}
 	}
 
 	getchar();

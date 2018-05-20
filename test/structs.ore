@@ -1,0 +1,34 @@
+
+struct Something { }
+type Int = *Something
+
+namespace first {
+	struct A {
+		var a: *A
+		var b: third.AliasB[Int]
+	}
+
+	struct B[T] {
+		var v: T
+		var d: second.D[T]
+	}
+}
+
+namespace second {
+	struct C {
+		var a: third.AliasA
+		var int: Int
+	}
+}
+
+namespace second {
+	struct D[T] {
+		var other: T
+	}
+}
+
+namespace third {
+	type AliasA = first.A
+	type AliasB[T] = first.B[T]
+}
+
